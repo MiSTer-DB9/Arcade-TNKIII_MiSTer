@@ -166,14 +166,21 @@ module emu
 	// 1 - D-/TX
 	// 2..6 - USR2..USR6
 	// Set USER_OUT to 1 to read from USER_IN.
-	input   [6:0] USER_IN,
-	output  [6:0] USER_OUT,
+	// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: USER_OSD + per-pin push-pull mask
+	output        USER_OSD,
+	output  [7:0] USER_PP,
+	// [MiSTer-DB9 END]
+	input   [7:0] USER_IN,
+	output  [7:0] USER_OUT,
 
 	input         OSD_STATUS
 );
 
 ///////// Default values for ports not used in this core /////////
 
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: USER_PP default
+assign USER_PP = USER_PP_DRIVE;
+// [MiSTer-DB9 END]
 assign ADC_BUS  = 'Z;
 //assign USER_OUT = '1;
 assign {UART_RTS, UART_TXD, UART_DTR} = 0;
@@ -236,6 +243,11 @@ localparam CONF_STR = {
 	"P3O[23:22],Native LS-30 Adapter,Off,OnlyP1,OnlyP2,P1&P2;",
 	"P3O[24],Use GRS Super JoyStick (Keystroke Mode), Off, On;",
 	"P3-;",
+	// [MiSTer-DB9-Pro BEGIN] - Saturn-first UserIO Joystick selector (joydb wrapper)
+	"P3O[127:126],UserIO Joystick,Off,Saturn,DB9MD,DB15;",
+	"P3O[125],UserIO Players,1 Player,2 Players;",
+	// [MiSTer-DB9-Pro END]
+	"P3-;",
 	"H1O[30:29],Rotary Speed,Normal,Slow,Fast,Very Fast;",
 	"DIP;",
 	"-;",
@@ -273,7 +285,9 @@ wire  [1:0] buttons;
 wire [127:0] status;
 wire [10:0] ps2_key;
 
-wire [15:0] joystick_0, joystick_1;
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: USB joystick words (joydb-or-USB muxed in Layer B)
+wire [15:0] joystick_0_USB, joystick_1_USB;
+// [MiSTer-DB9 END]
 
 //SNAC joysticks
 wire [1:0] SNAC_dev /* synthesis keep */;	
@@ -285,18 +299,98 @@ assign USE_GRS_SJOY = status[24];
 wire         JOY_CLK, JOY_LOAD;
 wire         JOY_DATA  = USER_IN[5];
 
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: joydb wrapper (UserIO Joystick path)
+// Native LS-30/DB15 SNAC and the joydb wrapper both arbitrate the same USER_IO
+// pins. snac_active = any native SNAC device selected → it preempts the joydb
+// wrapper: joy_type forced 0, USER_OUT driven inline (JOY_LOAD/JOY_CLK), so the
+// wrapper goes inert and injects no ghost inputs. When native SNAC is Off the
+// wrapper owns USER_IO and drives via USER_OUT_DRIVE.
+wire   [1:0] joy_type_raw    = status[127:126]; // 0=Off, 1=Saturn, 2=DB9MD, 3=DB15
+wire         snac_active     = |SNAC_dev | |SNAC_LS30;
+wire   [1:0] joy_type        = snac_active ? 2'd0 : joy_type_raw;
+wire         joy_2p          = status[125];
+wire         joy_db9md_en    = (joy_type == 2'd2);
+wire         joy_db15_en     = (joy_type == 2'd3);
+wire         joy_any_en      = |joy_type;
+wire         mt32_primary_active = 1'b0;
+wire         CLK_JOY         = CLK_50M;          // joydb scan clock (40-50 MHz)
+// [MiSTer-DB9 END]
+
+// [MiSTer-DB9-Pro BEGIN] - Saturn key gate
+wire         saturn_unlocked;                   // driven by hps_io UIO_DB9_KEY (0xFE)
+// [MiSTer-DB9-Pro END]
+
+// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: joydb wrapper wires + instance
+wire   [7:0] USER_OUT_DRIVE;
+wire   [7:0] USER_PP_DRIVE;
+wire  [15:0] joydb_1, joydb_2;
+wire         joydb_1ena, joydb_2ena;
+wire  [15:0] joy_raw_payload;
+// DB9 programmable-remap matrix: joydb_*_mapped = MiSTer-standard joystick
+// words (consumed in Layer B); db9_remap_* = 0xFD selector stream from hps_io.
+wire  [15:0] joydb_1_mapped, joydb_2_mapped;
+wire         db9_remap_cmd;
+wire   [5:0] db9_remap_byte_cnt;
+wire  [15:0] db9_remap_din;
+
+// [MiSTer-DB9 BEGIN] - DB9 remap factory default (used until Main_MiSTer streams UIO 0xFD)
+// Derived from CONF_STR J1, same rule as db9_map.cpp; lets the core work on a stock MiSTer binary.
+// DB15:  PUSH1=A, PUSH2=B, Start1=START, Coin=SELECT, Rotate Left=C, Rotate Right=D, Service=E, Pause=F
+// DB9MD: PUSH1=A, PUSH2=B, Start1=START, Coin=MODE, Rotate Left=C, Rotate Right=X, Service=Y, Pause=Z
+wire  [35:0] db9_remap_default_db15  = 36'hF9876BA54;
+wire  [35:0] db9_remap_default_db9md = 36'hF9876BA54;
+// [MiSTer-DB9 END]
+joydb joydb (
+  .clk             ( CLK_JOY         ),
+  .clk_sys         ( clk_53p6        ),
+  .USER_IN         ( USER_IN         ),
+  .OSD_STATUS          ( OSD_STATUS          ),
+  .snac_active         ( snac_active         ),
+  .mt32_primary_active ( mt32_primary_active ),
+  .joy_type        ( joy_type        ),
+  .joy_2p          ( joy_2p          ),
+  .saturn_unlocked ( saturn_unlocked ),
+  .USER_OUT_DRIVE  ( USER_OUT_DRIVE  ),
+  .USER_PP_DRIVE   ( USER_PP_DRIVE   ),
+  .USER_OSD        ( USER_OSD        ),
+  .joydb_1         ( joydb_1         ),
+  .joydb_2         ( joydb_2         ),
+  .joydb_1ena      ( joydb_1ena      ),
+  .joydb_2ena      ( joydb_2ena      ),
+  .remap_cmd       ( db9_remap_cmd      ),
+  .remap_byte_cnt  ( db9_remap_byte_cnt ),
+  .remap_din       ( db9_remap_din      ),
+  .remap_default_db15  ( db9_remap_default_db15  ),
+  .remap_default_db9md ( db9_remap_default_db9md ),
+  .joydb_1_mapped  ( joydb_1_mapped     ),
+  .joydb_2_mapped  ( joydb_2_mapped     ),
+  .joy_raw         ( joy_raw_payload )
+);
+
+// USER_OUT arbitration: native SNAC drives the cable inline when active (its
+// own LS-30/DB15 protocol on USER_OUT[0]/[1]); otherwise the joydb wrapper
+// drives via USER_OUT_DRIVE.
 always_comb begin
-	USER_OUT[0] = JOY_LOAD;
-	USER_OUT[1] = JOY_CLK;
-	USER_OUT[2] = 1'b1;
-	USER_OUT[3] = 1'b1;
-	USER_OUT[4] = 1'b1;
-	USER_OUT[5] = 1'b1;
-	USER_OUT[6] = 1'b1;
+	if (snac_active) begin
+		USER_OUT[0] = JOY_LOAD;
+		USER_OUT[1] = JOY_CLK;
+		USER_OUT[2] = 1'b1;
+		USER_OUT[3] = 1'b1;
+		USER_OUT[4] = 1'b1;
+		USER_OUT[5] = 1'b1;
+		USER_OUT[6] = 1'b1;
+		USER_OUT[7] = 1'b1;
+	end else begin
+		USER_OUT = USER_OUT_DRIVE;
+	end
 end
+// [MiSTer-DB9 END]
 
 wire [15:0] JOYDB15_1,JOYDB15_2;
-joy_db15 joy_db15
+// [MiSTer-DB9 BEGIN] - native DB15/LS-30 decoder renamed to avoid collision
+// with framework sys/joydb15.v (module joy_db15). Only live when snac_active.
+joy_db15_snac joy_db15_snac
+// [MiSTer-DB9 END]
 (
   .clk       ( clk_53p6  ), //53.6MHz
   .JOY_CLK   ( JOY_CLK   ),
@@ -322,6 +416,13 @@ always_comb begin
 	end
 end
 
+// [MiSTer-DB9-Pro BEGIN] - Layer B: joydb-or-USB merge (DB controllers muted while OSD open).
+// joydb_*_mapped is already in MiSTer-standard J1 order, identical to the USB
+// joystick word, so the downstream m_* assigns index it unchanged.
+wire [15:0] joystick_0 = joydb_1ena ? (OSD_STATUS ? 16'b0 : joydb_1_mapped) : joystick_0_USB;
+wire [15:0] joystick_1 = joydb_2ena ? (OSD_STATUS ? 16'b0 : joydb_2_mapped) : joydb_1ena ? joystick_0_USB : joystick_1_USB;
+// [MiSTer-DB9-Pro END]
+
 hps_io #(.CONF_STR(CONF_STR)) hps_io
 (
 	.clk_sys(clk_53p6),
@@ -346,8 +447,17 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.ioctl_wait(ioctl_wait),
 	
 	.ps2_key(ps2_key),
-	.joystick_0(joystick_0),
-	.joystick_1(joystick_1)
+	// [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: USB joystick wires renamed + joy_raw + remap stream
+	.joystick_0(joystick_0_USB),
+	.joystick_1(joystick_1_USB),
+	.joy_raw(joy_raw_payload),
+	.db9_remap_cmd(db9_remap_cmd),
+	.db9_remap_byte_cnt(db9_remap_byte_cnt),
+	.db9_remap_din(db9_remap_din),
+	// [MiSTer-DB9 END]
+	// [MiSTer-DB9-Pro BEGIN] - Saturn key gate
+	.saturn_unlocked(saturn_unlocked)
+	// [MiSTer-DB9-Pro END]
 );
 
 // PAUSE SYSTEM
